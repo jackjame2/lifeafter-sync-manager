@@ -23,3 +23,6 @@ WowOpenBox/
 # License server node_modules
 license-server/node_modules/
 license-server/.wrangler/
+
+# Wrangler config (deploy from license-server/ directory only)
+wrangler.jsonc
