@@ -6,7 +6,7 @@
     {
       "binding": "DB",
       "database_name": "license-db",
-      "database_id": "PLACEHOLDER_DATABASE_ID",
+      "database_id": "3dc6293b-0892-45d4-81ef-5ec22f25b902",
       "migrations_dir": "migrations"
     }
   ],
@@ -14,3 +14,4 @@
     "ADMIN_PASSWORD": "PLACEHOLDER_CHANGE_ME"
   }
 }
+
