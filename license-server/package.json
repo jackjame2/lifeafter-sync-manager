@@ -1,0 +1,15 @@
+{
+  "name": "license-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "db:migrate": "wrangler d1 migrations apply license-db --remote",
+    "db:migrate:local": "wrangler d1 migrations apply license-db --local"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

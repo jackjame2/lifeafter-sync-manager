@@ -1,0 +1,16 @@
+{
+  "name": "license-server",
+  "main": "src/index.js",
+  "compatibility_date": "2025-06-25",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "license-db",
+      "database_id": "PLACEHOLDER_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    "ADMIN_PASSWORD": "PLACEHOLDER_CHANGE_ME"
+  }
+}

@@ -1,0 +1,25 @@
+# KeymouseGo - excluded from git (too large, ~57MB)
+KeymouseGo_v5_2_1-win.exe
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Logs
+logs/
+
+# License key (user-specific)
+license.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# WowOpenBox is a separate submodule/repo
+WowOpenBox/
+
+# License server node_modules
+license-server/node_modules/
+license-server/.wrangler/

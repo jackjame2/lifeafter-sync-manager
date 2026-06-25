@@ -1,0 +1,25 @@
+{
+  "_comment": "游戏窗口同步器配置 - Game Window Synchronizer Config",
+
+  "process_name": "LifeAfter.exe",
+  "window_title_pattern": "",
+
+  "sync_mode": "foreground_polling",
+
+  "poll_interval_ms": 12,
+  "activate_delay_ms": 8,
+  "key_hold_ms": 20,
+  "return_focus": true,
+  "return_focus_delay_ms": 30,
+
+  "sync_hotkey": "ctrl+shift+s",
+  "quit_hotkey": "ctrl+shift+q",
+  "layout_hotkey": "ctrl+shift+l",
+  "refresh_windows_hotkey": "ctrl+shift+r",
+
+  "sync_enabled_keys": "all",
+
+  "sync_mouse": false,
+  "sync_mouse_clicks": false,
+  "sync_mouse_movement": false
+}
