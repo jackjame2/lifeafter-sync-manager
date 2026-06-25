@@ -11,7 +11,7 @@
     }
   ],
   "vars": {
-    "ADMIN_PASSWORD": "PLACEHOLDER_CHANGE_ME"
+    "ADMIN_PASSWORD": "123456"
   }
 }
 

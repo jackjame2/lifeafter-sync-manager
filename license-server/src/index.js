@@ -409,6 +409,13 @@ function adminHTML() {
   .verify-result.visible { display: block; }
   .verify-result.success { background: #064e3b; color: #6ee7b7; }
   .verify-result.fail { background: #450a0a; color: #fca5a5; }
+  .login-box { max-width: 400px; margin: 80px auto; text-align: center; padding: 40px; background: #1a1a1f; border-radius: 8px; }
+  .login-box h1 { margin-bottom: 16px; font-size: 20px; }
+  .login-box p { color: #999; margin-bottom: 20px; }
+  .login-box input { width: 100%; padding: 12px; border: 1px solid #333; border-radius: 6px; background: #0f0f11; color: #e4e4e7; font-size: 16px; margin-bottom: 12px; }
+  .login-box button { width: 100%; padding: 12px; background: #4f46e5; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; }
+  .login-box button:hover { background: #4338ca; }
+  #admin-page { display: none; }
 </style>
 </head>
 <body>
@@ -493,6 +500,17 @@ function adminHTML() {
 
 <script>
   const API_BASE = '';
+
+  async function login() {
+    const pwd = document.getElementById('loginPwd').value;
+    if (!pwd) return alert('请输入密码');
+    try {
+      const res = await fetch('/api/admin/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pwd }) });
+      const data = await res.json();
+      if (data.success) { sessionStorage.setItem('admin_token', data.token); document.getElementById('login-page').style.display = 'none'; document.getElementById('admin-page').style.display = 'block'; loadStats(); }
+      else { alert(data.error || '登录失败'); }
+    } catch(e) { alert('登录失败: ' + e.message); }
+  }
   let currentPage = 0, pageSize = 50, totalKeys = 0;
   let debounceTimer;
 
@@ -741,6 +759,20 @@ export default {
       }
     }
 
+    // ---- Admin Login (no auth required) ----
+    if (path === '/api/admin/verify' && method === 'POST') {
+      try {
+        const body = await request.json();
+        if (body.password === env.ADMIN_PASSWORD) {
+          const token = env.ADMIN_PASSWORD + ':' + Date.now().toString(36);
+          return json({ success: true, token });
+        }
+        return error('密码错误', 401);
+      } catch (e) {
+        return error('Invalid request', 400);
+      }
+    }
+
     // ---- Admin API (protected) ----
     if (path.startsWith('/api/admin/') && method === 'POST') {
       if (!checkAdmin(request, env)) {
@@ -775,5 +807,6 @@ export default {
     return error('Not found', 404);
   },
 };
+
 
 
