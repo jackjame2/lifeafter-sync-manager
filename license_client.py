@@ -16,64 +16,69 @@ import urllib.error
 
 # ---- Configuration ----
 # Change this to your deployed Worker URL after deployment
-_API_BASE = "https://YOUR_WORKER_NAME.YOUR_ACCOUNT.workers.dev"
+_API_BASE = "https://license-server.cdjjdfkdjd.workers.dev"
 _LICENSE_FILE = "license.key"
 
 
+def _read_machine_guid():
+    """Stable per-install Windows MachineGuid from the registry.
+
+    This is present on every Windows install and survives the removal of the
+    legacy `wmic` utility (deprecated / absent on Windows 11 24H2+), so it is the
+    primary, deterministic anchor for the hardware fingerprint.
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Cryptography",
+            0,
+            winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+        ) as k:
+            val, _ = winreg.QueryValueEx(k, "MachineGuid")
+            if val:
+                return str(val).strip()
+    except Exception:
+        pass
+    return None
+
+
 def get_hwid():
-    """Generate a hardware fingerprint unique to this machine."""
+    """Generate a deterministic hardware fingerprint unique to this machine."""
     parts = []
 
-    try:
-        # CPU Serial
-        result = subprocess.run(
-            ['wmic', 'cpu', 'get', 'ProcessorId'],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.stdout:
-            for line in result.stdout.splitlines():
-                stripped = line.strip()
-                if stripped and stripped != 'ProcessorId':
-                    parts.append(stripped)
-    except Exception:
-        pass
+    # Primary anchor: Windows MachineGuid (stable, always present).
+    mg = _read_machine_guid()
+    if mg:
+        parts.append("MG:" + mg)
 
-    try:
-        # BIOS Serial
-        result = subprocess.run(
-            ['wmic', 'bios', 'get', 'SerialNumber'],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.stdout:
-            for line in result.stdout.splitlines():
-                stripped = line.strip()
-                if stripped and stripped != 'SerialNumber':
-                    parts.append(stripped)
-    except Exception:
-        pass
+    # Supplemental hardware serials via wmic. Absent on Win11 24H2+ — ignored if so.
+    for args, label in (
+        (['wmic', 'cpu', 'get', 'ProcessorId'], 'ProcessorId'),
+        (['wmic', 'bios', 'get', 'SerialNumber'], 'SerialNumber'),
+        (['wmic', 'baseboard', 'get', 'SerialNumber'], 'SerialNumber'),
+    ):
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+            if result.stdout:
+                for line in result.stdout.splitlines():
+                    stripped = line.strip()
+                    if stripped and stripped != label:
+                        parts.append(stripped)
+        except Exception:
+            pass
 
+    # MAC address — ONLY if it is a real hardware address. uuid.getnode() returns a
+    # random value with the multicast bit (bit 40) set when it cannot read a NIC;
+    # using that would make the fingerprint change between runs (false lockouts).
     try:
-        # Baseboard Serial
-        result = subprocess.run(
-            ['wmic', 'baseboard', 'get', 'SerialNumber'],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.stdout:
-            for line in result.stdout.splitlines():
-                stripped = line.strip()
-                if stripped and stripped != 'SerialNumber':
-                    parts.append(stripped)
-    except Exception:
-        pass
-
-    try:
-        # MAC Address
         mac = uuid.getnode()
-        parts.append(hex(mac))
+        if not (mac >> 40) & 1:
+            parts.append(hex(mac))
     except Exception:
         pass
 
-    # Fallback: use hostname + machine info
+    # Last-resort fallback (only if nothing above worked): host/platform info.
     if not parts:
         parts.append(platform.node())
         parts.append(platform.machine())
@@ -89,7 +94,7 @@ def _api_call(endpoint, data):
     req = urllib.request.Request(
         url,
         data=json.dumps(data).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LifeAfter-Sync/1.0", "Accept": "application/json"},
         method="POST"
     )
     try:
@@ -104,19 +109,26 @@ def _api_call(endpoint, data):
         return {"error": f"网络连接失败: {e.reason}", "valid": False, "_offline": True}
 
 
-def verify_key(key):
-    """Verify if a license key is valid (without binding)."""
-    return _api_call("/api/verify", {"key": key})
+def verify_key(key, hwid=None):
+    """Verify if a license key is valid. Pass hwid to enforce device binding."""
+    payload = {"key": key}
+    if hwid:
+        payload["hwid"] = hwid
+    return _api_call("/api/verify", payload)
 
 
 def activate_key(key, hwid):
     """Activate (bind) a license key to this machine."""
     return _api_call("/api/activate", {"key": key, "hwid": hwid})
 
+def _app_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
 def load_saved_key():
     """Read the saved license key from local file."""
-    license_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _LICENSE_FILE)
+    license_path = os.path.join(_app_dir(), _LICENSE_FILE)
     if os.path.exists(license_path):
         try:
             with open(license_path, "r", encoding="utf-8") as f:
@@ -128,11 +140,44 @@ def load_saved_key():
 
 def save_key(key):
     """Save the license key to local file."""
-    license_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _LICENSE_FILE)
+    license_path = os.path.join(_app_dir(), _LICENSE_FILE)
     try:
         with open(license_path, "w", encoding="utf-8") as f:
             f.write(key)
         return True
+    except Exception:
+        return False
+
+
+_LAST_OK_FILE = "last_verify.dat"
+
+
+def mark_online_ok():
+    """Record the time of a successful ONLINE verification (for bounded offline grace)."""
+    try:
+        import time as _t
+        p = os.path.join(_app_dir(), _LAST_OK_FILE)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(str(int(_t.time())))
+        return True
+    except Exception:
+        return False
+
+
+def offline_grace_ok(max_seconds):
+    """True only if the last successful online verification was within max_seconds.
+
+    This bounds how long a machine can run while the license server is unreachable,
+    so blocking the domain can no longer grant indefinite offline use.
+    """
+    try:
+        import time as _t
+        p = os.path.join(_app_dir(), _LAST_OK_FILE)
+        if not os.path.exists(p):
+            return False
+        with open(p, "r", encoding="utf-8") as f:
+            ts = int(f.read().strip())
+        return (int(_t.time()) - ts) <= max_seconds
     except Exception:
         return False
 
@@ -150,27 +195,12 @@ def run_license_check(api_base=None):
     if api_base:
         _API_BASE = api_base
 
-    if "workers.dev" in _API_BASE:
-        print()
-        print("=" * 60)
-        print("   ⚠ 未配置 API 服务器地址！")
-        print("   请先完成 Cloudflare Worker 部署，然后修改")
-        print("   license_client.py 中的 _API_BASE 变量。")
-        print()
-        print("   开发模式：跳过卡密验证 (5秒后继续...)")
-        print("=" * 60)
-        print()
-        sys.stdout.flush()
-        import time
-        time.sleep(5)
-        return True
-
     hwid = get_hwid()
 
     # Try saved key first
     saved_key = load_saved_key()
     if saved_key:
-        result = verify_key(saved_key)
+        result = verify_key(saved_key, hwid)
         if result.get("valid"):
             return True
         if result.get("status") == "revoked":
@@ -180,7 +210,7 @@ def run_license_check(api_base=None):
             print("=" * 60)
             print()
             sys.stdout.flush()
-            os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), _LICENSE_FILE))
+            os.remove(os.path.join(_app_dir(), _LICENSE_FILE))
             return False
         if result.get("status") == "expired":
             print()

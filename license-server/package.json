@@ -10,6 +10,6 @@
     "db:migrate:local": "wrangler d1 migrations apply license-db --local"
   },
   "devDependencies": {
-    "wrangler": "^3.0.0"
+    "wrangler": "^4.104.0"
   }
 }

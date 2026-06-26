@@ -66,13 +66,47 @@ async function logAction(db, keyId, action, hwid, ip, details = '') {
   ).bind(keyId, action, ip, hwid, details).run();
 }
 
+// ---- Utility: Admin-auth rate limiting (per IP) ----
+const ADMIN_MAX_FAILURES = 10;   // failed admin attempts ...
+const ADMIN_WINDOW_MIN = 5;      // ... allowed per this many minutes before lockout
+
+async function isAdminRateLimited(db, ip) {
+  if (!ip) return false;
+  try {
+    const row = await db.prepare(
+      "SELECT COUNT(*) AS cnt FROM auth_attempts WHERE ip_address = ? AND created_at >= datetime('now', ?)"
+    ).bind(ip, `-${ADMIN_WINDOW_MIN} minutes`).first();
+    return (row?.cnt || 0) >= ADMIN_MAX_FAILURES;
+  } catch (e) {
+    return false; // fail open on limiter errors; auth still required
+  }
+}
+
+async function recordAuthFailure(db, ip) {
+  try {
+    await db.prepare('INSERT INTO auth_attempts (ip_address) VALUES (?)').bind(ip || '').run();
+  } catch (e) { /* best effort */ }
+}
+
+// ---- Utility: Centralized expiry check. Returns true if the row is now expired. ----
+async function enforceExpiry(db, row) {
+  if (row.expires_at && new Date(row.expires_at) < new Date()) {
+    if (row.status !== 'revoked' && row.status !== 'expired') {
+      await db.prepare("UPDATE license_keys SET status = 'expired' WHERE id = ?").bind(row.id).run();
+      row.status = 'expired';
+    }
+    return true;
+  }
+  return false;
+}
+
 // ============================================================
 // API Handlers
 // ============================================================
 
 // POST /api/verify - Verify a license key
 async function handleVerify(db, body, ip) {
-  const { key } = body;
+  const { key, hwid } = body;
   if (!key || typeof key !== 'string') return error('Missing key', 400);
 
   const normalized = normalizeKey(key);
@@ -87,15 +121,10 @@ async function handleVerify(db, body, ip) {
     return json({ valid: false, status: 'not_found', message: '卡密不存在' });
   }
 
-  // Check expiry
-  if (row.expires_at && new Date(row.expires_at) < new Date()) {
-    if (row.status !== 'revoked') {
-      await db.prepare("UPDATE license_keys SET status = 'expired' WHERE id = ?").bind(row.id).run();
-      row.status = 'expired';
-    }
-  }
+  // Lazily flip to 'expired' if past the validity window.
+  await enforceExpiry(db, row);
 
-  await logAction(db, row.id, 'verify', '', ip, `status=${row.status}`);
+  await logAction(db, row.id, 'verify', hwid || '', ip, `status=${row.status}`);
 
   if (row.status === 'revoked') {
     return json({ valid: false, status: 'revoked', message: '卡密已被禁用' });
@@ -104,12 +133,21 @@ async function handleVerify(db, body, ip) {
     return json({ valid: false, status: 'expired', message: '卡密已过期' });
   }
 
+  // Device binding enforcement: if the key is bound and the caller provides a hwid
+  // that does not match the bound device(s), reject. (hwid is omitted by the admin
+  // panel's quick-verify, which is allowed to inspect status without a device.)
+  if (hwid && typeof hwid === 'string' && row.hwid && row.hwid !== hwid && row.hwid_2 !== hwid) {
+    await logAction(db, row.id, 'verify_blocked', hwid, ip, 'device mismatch');
+    return json({ valid: false, status: 'device_mismatch', message: '该卡密已绑定到其他设备' });
+  }
+
   return json({
     valid: true,
     status: row.status,
     key_prefix: row.key_prefix,
     bound: !!row.hwid,
     activated_at: row.activated_at,
+    expires_at: row.expires_at,
   });
 }
 
@@ -124,7 +162,7 @@ async function handleActivate(db, body, ip) {
 
   const kh = await hashKey(key);
   const row = await db.prepare(
-    'SELECT id, key_prefix, status, hwid, hwid_2 FROM license_keys WHERE key_hash = ?'
+    'SELECT id, key_prefix, status, hwid, hwid_2, expires_at, duration_hours FROM license_keys WHERE key_hash = ?'
   ).bind(kh).first();
 
   if (!row) {
@@ -136,8 +174,10 @@ async function handleActivate(db, body, ip) {
     return json({ success: false, message: '卡密已被禁用，请联系管理员' });
   }
 
+  // Reject expired keys at activation time too (not only on verify).
+  await enforceExpiry(db, row);
   if (row.status === 'expired') {
-    return json({ success: false, message: '卡密已过期' });
+    return json({ success: false, status: 'expired', message: '卡密已过期' });
   }
 
   // If already bound to this hwid, just return success
@@ -146,7 +186,7 @@ async function handleActivate(db, body, ip) {
       'UPDATE license_keys SET activation_count = activation_count + 1 WHERE id = ?'
     ).bind(row.id).run();
     await logAction(db, row.id, 'reactivate', hwid, ip, 'already bound');
-    return json({ success: true, message: '验证成功', already_bound: true });
+    return json({ success: true, message: '验证成功', already_bound: true, expires_at: row.expires_at });
   }
 
   // If bound to a different hwid, reject
@@ -155,15 +195,17 @@ async function handleActivate(db, body, ip) {
     return json({ success: false, message: '该卡密已绑定到其他设备，请联系管理员解绑' });
   }
 
-  // Bind the key
-  const now = new Date().toISOString();
+  // First activation: bind the device and START the validity clock now.
+  const now = new Date();
+  const durationHours = Number(row.duration_hours) > 0 ? Number(row.duration_hours) : 3;
+  const expiresAt = new Date(now.getTime() + durationHours * 3600 * 1000).toISOString();
   await db.prepare(
-    "UPDATE license_keys SET hwid = ?, activated_at = ?, status = 'used', activation_count = 1 WHERE id = ?"
-  ).bind(hwid, now, row.id).run();
+    "UPDATE license_keys SET hwid = ?, activated_at = ?, expires_at = ?, status = 'used', activation_count = 1 WHERE id = ?"
+  ).bind(hwid, now.toISOString(), expiresAt, row.id).run();
 
-  await logAction(db, row.id, 'activate', hwid, ip, 'first activation');
+  await logAction(db, row.id, 'activate', hwid, ip, `first activation, expires ${expiresAt} (${durationHours}h)`);
 
-  return json({ success: true, message: '激活成功', key_prefix: row.key_prefix });
+  return json({ success: true, message: '激活成功', key_prefix: row.key_prefix, expires_at: expiresAt });
 }
 
 // ============================================================
@@ -210,10 +252,12 @@ async function handleAdminKeys(db, body) {
 async function handleAdminCreate(db, body) {
   const { count = 1, notes = '' } = body || {};
   const numKeys = Math.min(Math.max(1, parseInt(count) || 1), 100);
+  // Validity window (hours) that begins when the customer first activates. Default 3h.
+  const durationHours = Math.min(Math.max(1, parseInt(body?.duration_hours) || 3), 8760);
 
   const created = [];
   const stmt = db.prepare(
-    "INSERT INTO license_keys (key_hash, key_prefix, status, notes) VALUES (?, ?, 'active', ?)"
+    "INSERT INTO license_keys (key_hash, key_prefix, status, notes, duration_hours) VALUES (?, ?, 'active', ?, ?)"
   );
 
   // Use batch for efficiency
@@ -221,7 +265,7 @@ async function handleAdminCreate(db, body) {
   for (let i = 0; i < numKeys; i++) {
     const rawKey = generateKey();
     const kh = await hashKey(rawKey);
-    batchOps.push(stmt.bind(kh, rawKey.substring(0, 7) + '...', notes));
+    batchOps.push(stmt.bind(kh, rawKey.substring(0, 7) + '...', notes, durationHours));
     created.push(rawKey);
   }
 
@@ -230,18 +274,28 @@ async function handleAdminCreate(db, body) {
   return json({
     success: true,
     created: numKeys,
+    duration_hours: durationHours,
     keys: created,
-    message: `成功生成 ${numKeys} 个卡密`,
+    message: `成功生成 ${numKeys} 个卡密（有效期 ${durationHours} 小时，从激活时开始计时）`,
   });
 }
 
-// POST /api/admin/revoke - Revoke a key
-async function handleAdminRevoke(db, body) {
-  const { key } = body || {};
-  if (!key) return error('Missing key', 400);
+// Look up a key row by id (preferred — sent by the admin panel) or by full key.
+// `columns` is a fixed, code-controlled column list (never user input).
+async function lookupKey(db, body, columns) {
+  if (body && body.id !== undefined && body.id !== null && body.id !== '') {
+    return await db.prepare(`SELECT ${columns} FROM license_keys WHERE id = ?`).bind(body.id).first();
+  }
+  if (body && body.key) {
+    const kh = await hashKey(body.key);
+    return await db.prepare(`SELECT ${columns} FROM license_keys WHERE key_hash = ?`).bind(kh).first();
+  }
+  return null;
+}
 
-  const kh = await hashKey(key);
-  const row = await db.prepare('SELECT id, key_prefix, status FROM license_keys WHERE key_hash = ?').bind(kh).first();
+// POST /api/admin/revoke - Revoke a key (by id or key)
+async function handleAdminRevoke(db, body) {
+  const row = await lookupKey(db, body, 'id, key_prefix, status');
   if (!row) return error('Key not found', 404);
 
   await db.prepare("UPDATE license_keys SET status = 'revoked' WHERE id = ?").bind(row.id).run();
@@ -250,46 +304,40 @@ async function handleAdminRevoke(db, body) {
   return json({ success: true, message: `卡密 ${row.key_prefix} 已禁用` });
 }
 
-// POST /api/admin/unrevoke - Re-enable a revoked key
+// POST /api/admin/unrevoke - Re-enable a revoked key (by id or key)
 async function handleAdminUnrevoke(db, body) {
-  const { key } = body || {};
-  if (!key) return error('Missing key', 400);
-
-  const kh = await hashKey(key);
-  const row = await db.prepare('SELECT id, key_prefix, status FROM license_keys WHERE key_hash = ?').bind(kh).first();
+  const row = await lookupKey(db, body, 'id, key_prefix, status, hwid, expires_at');
   if (!row) return error('Key not found', 404);
 
-  const newStatus = row.hwid ? 'used' : 'active';
+  // Restore to the correct status: expired if past its window, else used if bound, else active.
+  let newStatus;
+  if (row.expires_at && new Date(row.expires_at) < new Date()) {
+    newStatus = 'expired';
+  } else {
+    newStatus = row.hwid ? 'used' : 'active';
+  }
   await db.prepare('UPDATE license_keys SET status = ? WHERE id = ?').bind(newStatus, row.id).run();
   await logAction(db, row.id, 'unrevoke', '', '', 'admin action');
 
   return json({ success: true, message: `卡密 ${row.key_prefix} 已恢复` });
 }
 
-// POST /api/admin/reset - Reset a key (unbind from machine)
+// POST /api/admin/reset - Reset a key (unbind from machine) (by id or key)
 async function handleAdminReset(db, body) {
-  const { key } = body || {};
-  if (!key) return error('Missing key', 400);
-
-  const kh = await hashKey(key);
-  const row = await db.prepare('SELECT id, key_prefix, hwid FROM license_keys WHERE key_hash = ?').bind(kh).first();
+  const row = await lookupKey(db, body, 'id, key_prefix, hwid');
   if (!row) return error('Key not found', 404);
 
   await db.prepare(
-    "UPDATE license_keys SET hwid = NULL, hwid_2 = NULL, activated_at = NULL, status = 'active', activation_count = 0 WHERE id = ?"
+    "UPDATE license_keys SET hwid = NULL, hwid_2 = NULL, activated_at = NULL, expires_at = NULL, status = 'active', activation_count = 0 WHERE id = ?"
   ).bind(row.id).run();
   await logAction(db, row.id, 'reset', '', '', 'admin action - unbound');
 
   return json({ success: true, message: `卡密 ${row.key_prefix} 已解绑，可重新绑定` });
 }
 
-// POST /api/admin/delete - Delete a key
+// POST /api/admin/delete - Delete a key (by id or key)
 async function handleAdminDelete(db, body) {
-  const { key } = body || {};
-  if (!key) return error('Missing key', 400);
-
-  const kh = await hashKey(key);
-  const row = await db.prepare('SELECT id, key_prefix FROM license_keys WHERE key_hash = ?').bind(kh).first();
+  const row = await lookupKey(db, body, 'id, key_prefix');
   if (!row) return error('Key not found', 404);
 
   await db.prepare('DELETE FROM usage_logs WHERE key_id = ?').bind(row.id).run();
@@ -419,9 +467,25 @@ function adminHTML() {
 </style>
 </head>
 <body>
-<div class="container">
+<!-- Login screen: enter the admin password once -->
+<div id="login-page" class="login-box">
   <h1>卡密管理系统</h1>
-  <p class="subtitle">License Key Manager &middot; Cloudflare Workers + D1</p>
+  <p>请输入管理员密码登录</p>
+  <input type="password" id="loginPwd" placeholder="管理员密码" onkeydown="if(event.key==='Enter')login()">
+  <button onclick="login()">登录</button>
+  <div id="login-error" style="color:#fca5a5;font-size:13px;margin-top:10px;display:none"></div>
+</div>
+
+<!-- Admin panel: hidden until login succeeds -->
+<div id="admin-page">
+<div class="container">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+    <div>
+      <h1>卡密管理系统</h1>
+      <p class="subtitle">License Key Manager &middot; Cloudflare Workers + D1</p>
+    </div>
+    <button class="secondary" onclick="logout()">退出登录</button>
+  </div>
 
   <!-- Stats Card -->
   <div class="card">
@@ -441,6 +505,7 @@ function adminHTML() {
     <h2>生成卡密</h2>
     <div class="input-group">
       <input type="number" id="gen-count" value="1" min="1" max="100" placeholder="生成数量">
+      <input type="number" id="gen-duration" value="3" min="1" placeholder="有效期(小时)" title="激活后多少小时过期">
       <input type="text" id="gen-notes" placeholder="备注 (可选)">
       <button onclick="generateKeys()">生成卡密</button>
     </div>
@@ -478,9 +543,9 @@ function adminHTML() {
     <div id="keys-table-container">
       <table>
         <thead><tr>
-          <th>卡密</th><th>状态</th><th>创建时间</th><th>激活时间</th><th>设备ID</th><th>激活次数</th><th>备注</th><th>操作</th>
+          <th>卡密</th><th>状态</th><th>创建时间</th><th>激活时间</th><th>到期时间</th><th>设备ID</th><th>激活次数</th><th>备注</th><th>操作</th>
         </tr></thead>
-        <tbody id="keys-tbody"><tr><td colspan="8" class="empty-state">Loading...</td></tr></tbody>
+        <tbody id="keys-tbody"><tr><td colspan="9" class="empty-state">Loading...</td></tr></tbody>
       </table>
     </div>
     <div class="pagination" id="pagination"></div>
@@ -495,24 +560,51 @@ function adminHTML() {
     </table>
   </div>
 </div>
+</div>
 
 <div class="toast" id="toast"></div>
 
 <script>
   const API_BASE = '';
 
-  async function login() {
-    const pwd = document.getElementById('loginPwd').value;
-    if (!pwd) return alert('请输入密码');
-    try {
-      const res = await fetch('/api/admin/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pwd }) });
-      const data = await res.json();
-      if (data.success) { sessionStorage.setItem('admin_token', data.token); document.getElementById('login-page').style.display = 'none'; document.getElementById('admin-page').style.display = 'block'; loadStats(); }
-      else { alert(data.error || '登录失败'); }
-    } catch(e) { alert('登录失败: ' + e.message); }
-  }
   let currentPage = 0, pageSize = 50, totalKeys = 0;
   let debounceTimer;
+
+  async function login() {
+    const pwd = document.getElementById('loginPwd').value;
+    const errEl = document.getElementById('login-error');
+    errEl.style.display = 'none';
+    if (!pwd) { errEl.textContent = '请输入密码'; errEl.style.display = 'block'; return; }
+    try {
+      const res = await fetch('/api/admin/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pwd }) });
+      if (res.ok) {
+        sessionStorage.setItem('admin_pw', pwd);
+        showAdmin();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        errEl.textContent = data.error || ('登录失败 (' + res.status + ')');
+        errEl.style.display = 'block';
+      }
+    } catch(e) { errEl.textContent = '登录失败: ' + e.message; errEl.style.display = 'block'; }
+  }
+
+  function showAdmin() {
+    document.getElementById('login-page').style.display = 'none';
+    document.getElementById('admin-page').style.display = 'block';
+    loadStats(); loadKeys(); loadLogs();
+  }
+
+  function logout() {
+    sessionStorage.removeItem('admin_pw');
+    document.getElementById('admin-page').style.display = 'none';
+    document.getElementById('login-page').style.display = 'block';
+    var pe = document.getElementById('loginPwd'); if (pe) pe.value = '';
+  }
+
+  // Auth = the admin password entered at login (stored for this browser session only).
+  function getPassword() {
+    return sessionStorage.getItem('admin_pw') || '';
+  }
 
   async function api(path, body) {
     const res = await fetch(API_BASE + path, {
@@ -520,16 +612,9 @@ function adminHTML() {
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + getPassword() },
       body: body ? JSON.stringify(body) : undefined,
     });
+    if (res.status === 401) { showToast('登录已失效，请重新登录', true); logout(); return { error: '未授权' }; }
+    if (res.status === 429) { showToast('操作过于频繁，请稍后再试', true); return { error: '频率限制' }; }
     return res.json();
-  }
-
-  function getPassword() {
-    let pw = sessionStorage.getItem('admin_pw');
-    if (!pw) {
-      pw = prompt('请输入管理员密码:');
-      if (pw) sessionStorage.setItem('admin_pw', pw);
-    }
-    return pw || '';
   }
 
   function showToast(msg, isError) {
@@ -566,21 +651,22 @@ function adminHTML() {
     totalKeys = data.total;
     const tbody = document.getElementById('keys-tbody');
     if (!data.keys || data.keys.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="8" class="empty-state">没有找到卡密</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="9" class="empty-state">没有找到卡密</td></tr>';
     } else {
       tbody.innerHTML = data.keys.map(k => '<tr>' +
         '<td class="key-cell">' + k.key_prefix + '</td>' +
         '<td>' + statusBadge(k.status) + '</td>' +
         '<td>' + formatDate(k.created_at) + '</td>' +
         '<td>' + formatDate(k.activated_at) + '</td>' +
+        '<td>' + formatDate(k.expires_at) + '</td>' +
         '<td class="hwid-cell" title="' + (k.hwid || '') + '">' + (k.hwid ? k.hwid.substring(0, 24) + '...' : '-') + '</td>' +
         '<td>' + k.activation_count + '</td>' +
         '<td>' + (k.notes || '-') + '</td>' +
         '<td class="actions">' +
-          (k.status === 'revoked' ? '<button class="warn" onclick="unrevokeKey(\\'' + k.key_prefix + '\\')">恢复</button>' : '') +
-          (k.status !== 'revoked' ? '<button class="danger" onclick="revokeKey(\\'' + k.key_prefix + '\\')">禁用</button>' : '') +
-          '<button class="warn" onclick="resetKey(\\'' + k.key_prefix + '\\')">解绑</button>' +
-          '<button class="danger" onclick="deleteKey(\\'' + k.key_prefix + '\\')">删除</button>' +
+          (k.status === 'revoked' ? '<button class="warn" onclick="unrevokeKey(' + k.id + ')">恢复</button>' : '') +
+          (k.status !== 'revoked' ? '<button class="danger" onclick="revokeKey(' + k.id + ')">禁用</button>' : '') +
+          '<button class="warn" onclick="resetKey(' + k.id + ')">解绑</button>' +
+          '<button class="danger" onclick="deleteKey(' + k.id + ')">删除</button>' +
         '</td>' +
       '</tr>').join('');
     }
@@ -626,7 +712,8 @@ function adminHTML() {
   async function generateKeys() {
     const count = parseInt(document.getElementById('gen-count').value) || 1;
     const notes = document.getElementById('gen-notes').value;
-    const data = await api('/api/admin/create', { count, notes });
+    const duration_hours = parseInt(document.getElementById('gen-duration').value) || 3;
+    const data = await api('/api/admin/create', { count, notes, duration_hours });
     if (data.error) { showToast(data.error, true); return; }
     showToast(data.message);
     const box = document.getElementById('generated-keys-box');
@@ -653,36 +740,28 @@ function adminHTML() {
     URL.revokeObjectURL(url);
   }
 
-  async function revokeKey(prefix) {
-    // Need the full key - prompt user
-    const fullKey = prompt('请输入完整卡密以确认禁用:\\n(前缀: ' + prefix + ')');
-    if (!fullKey) return;
-    const data = await api('/api/admin/revoke', { key: fullKey });
+  async function revokeKey(id) {
+    const data = await api('/api/admin/revoke', { id });
     if (data.error) showToast(data.error, true);
     else { showToast(data.message); loadStats(); loadKeys(); }
   }
 
-  async function unrevokeKey(prefix) {
-    const fullKey = prompt('请输入完整卡密以恢复:\\n(前缀: ' + prefix + ')');
-    if (!fullKey) return;
-    const data = await api('/api/admin/unrevoke', { key: fullKey });
+  async function unrevokeKey(id) {
+    const data = await api('/api/admin/unrevoke', { id });
     if (data.error) showToast(data.error, true);
     else { showToast(data.message); loadStats(); loadKeys(); }
   }
 
-  async function resetKey(prefix) {
-    const fullKey = prompt('请输入完整卡密以解绑:\\n(前缀: ' + prefix + ')');
-    if (!fullKey) return;
-    const data = await api('/api/admin/reset', { key: fullKey });
+  async function resetKey(id) {
+    if (!confirm('确定解绑该卡密？解绑后可在新设备重新激活。')) return;
+    const data = await api('/api/admin/reset', { id });
     if (data.error) showToast(data.error, true);
     else { showToast(data.message); loadStats(); loadKeys(); }
   }
 
-  async function deleteKey(prefix) {
-    const fullKey = prompt('请输入完整卡密以删除 (此操作不可恢复!):\\n(前缀: ' + prefix + ')');
-    if (!fullKey) return;
-    if (!confirm('确定要永久删除该卡密吗？')) return;
-    const data = await api('/api/admin/delete', { key: fullKey });
+  async function deleteKey(id) {
+    if (!confirm('确定永久删除该卡密？此操作不可恢复！')) return;
+    const data = await api('/api/admin/delete', { id });
     if (data.error) showToast(data.error, true);
     else { showToast(data.message); loadStats(); loadKeys(); }
   }
@@ -699,18 +778,16 @@ function adminHTML() {
     el.classList.add('visible');
     if (data.valid) {
       el.className = 'verify-result visible success';
-      el.innerHTML = '&#10003; 卡密有效 | 前缀: ' + data.key_prefix + ' | 状态: ' + data.status + (data.bound ? ' | 已绑定设备' : ' | 未绑定');
+      el.innerHTML = '&#10003; 卡密有效 | 前缀: ' + data.key_prefix + ' | 状态: ' + data.status + (data.bound ? ' | 已绑定设备' : ' | 未绑定') + (data.expires_at ? ' | 到期: ' + formatDate(data.expires_at) : '');
     } else {
       el.className = 'verify-result visible fail';
       el.innerHTML = '&#10007; ' + data.message + ' (状态: ' + data.status + ')';
     }
   }
 
-  // Init
+  // Init: show admin if already logged in this session, else the login screen.
   window.addEventListener('DOMContentLoaded', () => {
-    loadStats();
-    loadKeys();
-    loadLogs();
+    if (getPassword()) showAdmin();
   });
 </script>
 </body>
@@ -761,12 +838,17 @@ export default {
 
     // ---- Admin Login (no auth required) ----
     if (path === '/api/admin/verify' && method === 'POST') {
+      if (await isAdminRateLimited(env.DB, ip)) {
+        return error('尝试次数过多，请稍后再试', 429);
+      }
       try {
         const body = await request.json();
         if (body.password === env.ADMIN_PASSWORD) {
-          const token = env.ADMIN_PASSWORD + ':' + Date.now().toString(36);
+          // Opaque session marker — does NOT contain the admin password.
+          const token = 'ok:' + Date.now().toString(36);
           return json({ success: true, token });
         }
+        await recordAuthFailure(env.DB, ip);
         return error('密码错误', 401);
       } catch (e) {
         return error('Invalid request', 400);
@@ -775,7 +857,11 @@ export default {
 
     // ---- Admin API (protected) ----
     if (path.startsWith('/api/admin/') && method === 'POST') {
+      if (await isAdminRateLimited(env.DB, ip)) {
+        return error('尝试次数过多，请稍后再试', 429);
+      }
       if (!checkAdmin(request, env)) {
+        await recordAuthFailure(env.DB, ip);
         return error('未授权访问', 401);
       }
 

@@ -7,6 +7,14 @@ __pycache__/
 
 # Logs
 logs/
+*.log
+
+# PyInstaller build artifacts (rebuildable, never commit)
+build/
+dist/
+
+# Runtime / activation cache (machine-specific)
+last_verify.dat
 
 # License key (user-specific)
 license.key
@@ -24,5 +32,8 @@ WowOpenBox/
 license-server/node_modules/
 license-server/.wrangler/
 
-# Wrangler config (deploy from license-server/ directory only)
-wrangler.jsonc
+# Local dev secrets for wrangler (never commit)
+license-server/.dev.vars
+
+# NOTE: license-server/wrangler.jsonc IS tracked (needed for GitHub Actions deploy).
+# It must contain NO secrets — ADMIN_PASSWORD is a Cloudflare secret (wrangler secret put).
